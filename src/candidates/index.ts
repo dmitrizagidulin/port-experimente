@@ -88,5 +88,13 @@ export const candidates: CandidateEntry[] = [
     transport: 'eigener-server',
     nodeOnly: 'braucht Node ≥ 24 (was-teaching-server, @interop/was-client); läuft in Node, nicht im Browser',
   },
+  {
+    id: 'rltp-beekem-datarooms',
+    title: 'RLTP über BeeKEM auf einem OpenVTC Data Room als blindem Speicher (E16 Stufe 1: VTC als Host, Rahmen als versiegelte Records, Geräte als vti-rooms-wasm-Mitglieder in Node, Owner-VTA nur für die Aufnahme; Versionen raumweit)',
+    loadRuns: 1,
+    loadSize: { members: 30, operations: 100 },
+    transport: 'eigener-server',
+    nodeOnly: 'braucht den lokalen VTI-Stack (VTC, VTA, Raum; rltp/design/openvtc-local-stack/provision-e16.sh) und /tmp/vdr/e16/room.json; läuft in Node, nicht im Browser und nicht in der CI',
+  },
   { id: 'klartext', title: 'Klartext (Null-Kandidat, zeigt nur, dass der Prüfstand Fehler erkennt)', make: klartext, loadRuns: 5, transport: 'prüfstand-relay' },
 ]

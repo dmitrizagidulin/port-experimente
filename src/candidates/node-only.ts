@@ -13,6 +13,10 @@ export const nodeCandidates: Array<CandidateEntry & { make: NonNullable<Candidat
     ...candidates.find((c) => c.id === 'rltp-beekem-pws')!,
     make: async () => (await import('./pws')).rltpBeekemPws(),
   },
+  {
+    ...candidates.find((c) => c.id === 'rltp-beekem-datarooms')!,
+    make: async () => (await import('./datarooms')).rltpBeekemDatarooms(),
+  },
 ]
 
 /** Alle Kandidaten mit Code, für Berichte in Node. */
