@@ -404,6 +404,10 @@ export const candidateEn: Record<string, { name: string; desc: string }> = {
     "name": "RLTP / BeeKEM on PWS",
     "desc": "Portable Web Spaces (was-teaching-server 0.42) as blind storage"
   },
+  "rltp-beekem-datarooms": {
+    "name": "RLTP / BeeKEM on a Data Room",
+    "desc": "an OpenVTC Data Room (VTI, VTC as host) as blind storage; devices as vti-rooms-wasm members in Node, the owner's VTA admits"
+  },
   "k0-one-seed": {
     "name": "K0: one seed, no merge",
     "desc": "every device derives all keys from one seed and keeps its own holder state, nothing is merged; the baseline that has to fail"

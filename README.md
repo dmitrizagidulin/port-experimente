@@ -57,6 +57,7 @@ workshop repository (`rltp/design/port-experimente-2026-10.md`).
 | `rltp-beekem` | authority log by the conflict matrix, keys from BeeKEM 0.4.0 | bench relay |
 | `rltp-beekem-sichten`, `-logreplik` | the same with an enforcing service at the relay (class view or class log) | bench relay, enforcing |
 | `rltp-beekem-pws` | the same on Portable Web Spaces (was-teaching-server 0.42) as blind storage | own server, Node only |
+| `rltp-beekem-datarooms` | the same on an OpenVTC Data Room (VTI 6c57452a: VTC as host, frames as sealed records, devices as `vti-rooms-wasm` members in Node, owner VTA only for admission) as blind storage (E16) | own server, Node only, local VTI stack |
 | `rltp-mls`, `rltp-mls-sichten` | the same candidate code, keys from MLS (OpenMLS 0.9.1) | bench relay |
 | `consensual-mls-any-staged`, `-owner` | MLS without an authority log, the commit decides membership (room model) | bench relay |
 | `klartext` | null candidate without encryption; shows that the bench detects faults | bench relay |
