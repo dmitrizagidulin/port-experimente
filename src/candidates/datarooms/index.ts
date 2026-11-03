@@ -120,23 +120,34 @@ interface DeviceState {
   lastError?: string
   seen: Set<string>
   held: Map<string, Msg>
+  /** Records listed for this device and not yet processed: the listing cursor moves past them, this map holds them until they are delivered, withheld or given up. */
+  pending: Map<string, Listed>
 }
+
+type Listed = { key: string; version: number; author: string; sealed?: { epoch?: number; version?: number } }
 
 const LOCAL = Symbol('local')
 
 export interface DataroomsOptions {
   readonly label?: string
+  /** Test seams: a host (HTTP) of the test's own, members of the test's own, a room config instead of the file. */
+  readonly fetch?: typeof fetch
+  readonly pool?: LiveMember[]
+  readonly room?: RoomConfig
 }
 
+export type { LiveMember, RoomConfig }
+
 export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promise<Candidate & { room: DataroomsHandle }> {
-  const W = await loadWasm()
-  const cfg = JSON.parse(readFileSync(ROOM_FILE, 'utf8')) as RoomConfig
+  const W = options.pool ? undefined : await loadWasm()
+  const cfg = options.room ?? (JSON.parse(readFileSync(ROOM_FILE, 'utf8')) as RoomConfig)
+  const doFetch = options.fetch ?? fetch
   const roomKey = hex(cfg.roomKeyHex)
   const inner = rltpBeekem()
   const run = randomUUID().slice(0, 8)
   const devices = new Map<Device, DeviceState>()
   let idle = 0
-  const stats = { puts: 0, lists: 0, gets: 0, commitsApplied: 0, versionRetries: 0, bytesUp: 0, admittedFresh: 0, rateLimited: 0, rateLimitWaitMs: 0 }
+  const stats = { puts: 0, lists: 0, gets: 0, commitsApplied: 0, versionRetries: 0, versionMismatches: 0, bytesUp: 0, admittedFresh: 0, rateLimited: 0, rateLimitWaitMs: 0, transientRetries: 0 }
   const limiters = new Set<string>()
   const notes: string[] = []
 
@@ -169,7 +180,22 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
     const signed = s.identity.signDocument(JSON.stringify(doc))
     return timed(async () => {
       for (let attempt = 0; ; attempt++) {
-        const res = await fetch(cfg.hostUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: signed })
+        let res: Response
+        try {
+          res = await doFetch(cfg.hostUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: signed })
+        } catch (e) {
+          // No answer at all (connection refused, reset): a few tries, then the caller sees the error and the frame stays pending.
+          if (attempt >= 3) throw new HostError(0, 'network', String(e))
+          stats.transientRetries++
+          await sleep(250 * (attempt + 1))
+          continue
+        }
+        if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < 3) {
+          await res.text().catch(() => '')
+          stats.transientRetries++
+          await sleep(250 * (attempt + 1))
+          continue
+        }
         const text = await res.text()
         let reply: { type?: string; issuer?: string; threadId?: string; payload?: { code?: string } & Record<string, unknown>; error?: string; limiter?: string; retryAfterSecs?: number } = {}
         try {
@@ -212,11 +238,12 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
   // ── Admission: from the pool, or fresh through the owner's VTA ────────────
   const claimed: LiveMember[] = []
   function claimIdentity(d: Device): LiveMember {
-    const live = pool(W).shift() ?? admitFresh(d)
+    const live = (options.pool ?? pool(W!)).shift() ?? admitFresh(d)
     claimed.push(live)
     return live
   }
   function admitFresh(d: Device) {
+    if (!W) throw new Error('no member left in the test pool')
     const env = { ...process.env, VTA_ALLOW_PRIVATE_ENDPOINTS: '1', PNM_HOME: cfg.pnmHome, PATH: `${PNM_PATH}:${process.env.PATH}` }
     const pnm = (...a: string[]) => {
       for (let t = 0; ; t++) {
@@ -264,7 +291,6 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
   // ── Push: every pending frame of a device becomes a sealed record ─────────
   /** The room's head version as far as this run has seen it: advanced by every listing and every put. */
   let roomHead = 0
-  type Listed = { key: string; version: number; author: string; sealed?: { epoch?: number; version?: number } }
   /** List records above `since` (and under `prefix`), following the host's cursor to its absence (the only end-of-listing signal). */
   async function listAbove(s: DeviceState, since: number, prefix?: string): Promise<Listed[]> {
     const out: Listed[] = []
@@ -312,14 +338,25 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
       // Room-wide version: head + 1, read once per push and advanced locally; re-read on a collision (measured).
       head ??= await headVersion(s)
       let version = head + 1
+      let putKey = key
       let stored: { version: number } | undefined
       for (let attempt = 0; attempt < 8 && !stored; attempt++) {
-        const sealed = s.member.sealRecord(key, BigInt(version), plain)
+        const sealed = s.member.sealRecord(putKey, BigInt(version), plain)
         try {
-          stored = await task<{ version: number }>(s, 'records/put/0.1', { roomId: cfg.roomDid, key, presentation: present(s, 'write'), expectedVersion: 0, sealed: JSON.parse(sealed) })
-          head = stored.version
-          roomHead = Math.max(roomHead, stored.version)
-          sealedByKey.set(key, { sealed, frame })
+          const put = await task<{ version: number }>(s, 'records/put/0.1', { roomId: cfg.roomDid, key: putKey, presentation: present(s, 'write'), expectedVersion: 0, sealed: JSON.parse(sealed) })
+          head = put.version
+          roomHead = Math.max(roomHead, put.version)
+          if (put.version !== version) {
+            // The host stored the record under a version other than the one the seal is bound to (a write landed in
+            // between): nobody can open it. It stays as garbage under its key; the frame goes again under a fresh key.
+            stats.versionMismatches++
+            notes.push(`${d}: ${putKey} sealed v${version}, stored v${put.version}; sealed again`)
+            version = put.version + 1
+            putKey = `${key}.${attempt + 1}`
+            continue
+          }
+          stored = put
+          sealedByKey.set(putKey, { sealed, frame })
           carriedLog.push({ id: ++carriedId, from: d, label, body: enc.encode(sealed) })
         } catch (e) {
           if (e instanceof HostError && /epoch|commit/i.test(e.detail)) {
@@ -388,28 +425,41 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
       s.held.delete(key)
       if (!s.seen.has(key)) await deliver(key, msg)
     }
-    const listed = { records: await listAbove(s, s.sinceVersion, `${run}/`) }
-    const records = listed.records.filter((r) => r.version > s.sinceVersion).sort((a, b) => a.version - b.version)
-    for (const r of faultState.reverse ? [...records].reverse() : records) {
+    // List above the cursor and remember every new record before the cursor moves: a failed fetch or a
+    // host that is away for a moment must not skip a record for good (review #90 B1).
+    const listed = await listAbove(s, s.sinceVersion, `${run}/`)
+    for (const r of listed) {
+      if (r.version > s.sinceVersion && !s.seen.has(r.key) && !s.pending.has(r.key)) s.pending.set(r.key, r)
       s.sinceVersion = Math.max(s.sinceVersion, r.version)
-      if (s.seen.has(r.key)) continue
-      if (r.key.startsWith(`${run}/${d}/`)) {
-        s.seen.add(r.key)
+    }
+    const todo = [...s.pending.values()].sort((a, b) => a.version - b.version)
+    for (const r of faultState.reverse ? todo.reverse() : todo) {
+      if (s.seen.has(r.key)) {
+        s.pending.delete(r.key)
         continue
       }
+      if (r.key.startsWith(`${run}/${d}/`)) {
+        s.seen.add(r.key)
+        s.pending.delete(r.key)
+        continue
+      }
+      // A host error here propagates: the record stays pending and the next pull takes it again.
       const got = await task<{ version: number; sealed: { version?: number } & Record<string, unknown> }>(s, 'records/get/0.1', { roomId: cfg.roomDid, key: r.key, presentation: present(s, 'read') })
       stats.gets++
       let plain: Uint8Array
       try {
         plain = await openRecord(s, r.key, got.sealed.version ?? got.version, got.sealed)
       } catch (e) {
+        if (e instanceof HostError) throw e // the commit fetch failed at the host: pending, not given up
         // A record this member cannot open (a replayed seal under another key, or a foreign seal): the carrier delivered nothing usable.
         notes.push(`${d}: ${r.key} does not open (record epoch ${String((got.sealed as { epoch?: number }).epoch)} v${got.version}/${String(got.sealed.version)}, member epoch ${s.member.epoch}): ${String(e).slice(0, 60)}`)
         s.seen.add(r.key)
+        s.pending.delete(r.key)
         continue
       }
       const f = JSON.parse(dec.decode(plain)) as Frame
       const msg: Msg = { id: ++carriedId, from: f.from, label: f.label, body: unb64(f.b) }
+      s.pending.delete(r.key)
       if (withheld(msg)) {
         s.held.set(r.key, msg)
         continue
@@ -519,13 +569,13 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
     },
     async dispose() {
       // Nothing to stop: the host and the room live outside the process. The run's keys stay in the room; the members go back to the pool.
-      pool(W).push(...claimed.splice(0))
+      ;(options.pool ?? pool(W!)).push(...claimed.splice(0))
     },
     rerunRepair: (d) => inner.rerunRepair?.(d),
 
     async addDevice(p, d) {
       await inner.addDevice(p, d)
-      const s: DeviceState = { person: p, online: true, doc: new Y.Doc(), ...claimIdentity(d), synced: false, outbox: [], seq: 0, sinceVersion: 0, seen: new Set(), held: new Map() }
+      const s: DeviceState = { person: p, online: true, doc: new Y.Doc(), ...claimIdentity(d), synced: false, outbox: [], seq: 0, sinceVersion: 0, seen: new Set(), held: new Map(), pending: new Map() }
       devices.set(d, s)
       await push(s, d)
     },
@@ -557,7 +607,7 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
     takeOutgoing: () => [],
     receive: (d, m) => inner.receive(d, m),
     members: (d) => inner.members(d),
-    status: (d) => `${inner.status(d)}; room puts=${stats.puts} lists=${stats.lists} gets=${stats.gets} commits=${stats.commitsApplied} versionRetries=${stats.versionRetries} 429=${stats.rateLimited}${dev(d).outbox.length ? `; outbox=${dev(d).outbox.length}` : ''}${dev(d).lastError ? `; ${dev(d).lastError}` : ''}${notes.length ? '; ' + notes.slice(0, 2).join('; ') : ''}`,
+    status: (d) => `${inner.status(d)}; room puts=${stats.puts} lists=${stats.lists} gets=${stats.gets} commits=${stats.commitsApplied} versionRetries=${stats.versionRetries} mismatches=${stats.versionMismatches} 429=${stats.rateLimited} transient=${stats.transientRetries}${dev(d).outbox.length ? `; outbox=${dev(d).outbox.length}` : ''}${dev(d).lastError ? `; ${dev(d).lastError}` : ''}${notes.length ? '; ' + notes.slice(0, 2).join('; ') : ''}`,
     steal: (d) => inner.steal(d),
     attackerOpen: (st, m) => inner.attackerOpen(st, m),
   }
@@ -575,7 +625,7 @@ class HostError extends Error {
 
 export interface DataroomsHandle {
   readonly run: string
-  readonly stats: { puts: number; lists: number; gets: number; commitsApplied: number; versionRetries: number; bytesUp: number; admittedFresh: number; rateLimited: number; rateLimitWaitMs: number }
+  readonly stats: { puts: number; lists: number; gets: number; commitsApplied: number; versionRetries: number; versionMismatches: number; bytesUp: number; admittedFresh: number; rateLimited: number; rateLimitWaitMs: number; transientRetries: number }
   limiters(): string[]
   readonly roomDid: string
   readonly hostDid: string

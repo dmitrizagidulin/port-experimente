@@ -10,4 +10,5 @@ src/candidates/rltp-mls/pkg
 # Berichtsausgabe (REPORT=1 pnpm test report)
 matrix.md
 src/candidates/rltp-mls/pkg
-src/candidates/datarooms/pkg
+src/candidates/datarooms/pkg/*
+!src/candidates/datarooms/pkg/*.d.ts

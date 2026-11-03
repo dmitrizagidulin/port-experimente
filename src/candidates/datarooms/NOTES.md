@@ -114,6 +114,20 @@ Two findings from building it, both about the host, not the candidate:
    trap the browser spike of 22 October hit. The candidate follows the
    cursor and keeps the head across devices.
 
+Review #90 (3 November) found a third thing, in the hull rather than at the
+host: the listing cursor moved past a record before its fetch had succeeded,
+so one failed `get` (a 503, a reset) skipped that record for good. Now every
+listed record is held as pending until it is delivered, withheld or given up
+(a seal that does not open), whatever order the carrier delivers in; a host
+error leaves it pending and the next pull takes it again. The hull also
+retries 502/503/504 and connection errors three times before the caller
+sees them, and when the host stores a record under a version other than the
+one the seal is bound to (a write landed in between), the frame goes again
+under a fresh key and the orphan stays as garbage (`stats.versionMismatches`).
+`tests/datarooms-cursor.test.ts` pins all of this against a host of its own
+(no VTI stack): pages of two, the failed fetch, reverse delivery, the single
+503, the version skew.
+
 What the host learned (check 3): keys `<run>/<device>/<seq>`, authors as
 did:key, versions, epochs, sizes and times. From that it can count devices
 and frames per run and see which devices write together; it cannot tell a
