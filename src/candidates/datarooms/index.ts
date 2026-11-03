@@ -392,19 +392,48 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
   }
 
   // ── Pull: list the run's records above the device's version, open the others' ─
-  async function openRecord(s: DeviceState, key: string, version: number, sealed: unknown): Promise<Uint8Array> {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        return s.member.openRecord(key, BigInt(version), JSON.stringify(sealed))
-      } catch (e) {
-        if (attempt < 2 && /epoch|commit/i.test(String(e))) {
-          await sync(s)
-          continue
-        }
-        throw e
-      }
+  // ── Three separate judgements per record (review #90, Anton 3 November) ──
+  // Fetching, bringing the member to the record's epoch, and opening the seal are
+  // three steps with three results. Only the last may declare a record invalid
+  // for good; the first two can only say "not yet": the record stays pending,
+  // whatever the exception looked like (a 503, a reset, a TypeError from a
+  // broken download, a host that is away).
+  type Got = { version: number; sealed: { version?: number; epoch?: number } & Record<string, unknown> }
+  type Fetch = { done: true; got: Got } | { done: false; why: string }
+  type Epoch = { done: true } | { done: false; why: string }
+  type Open = { valid: true; plain: Uint8Array } | { valid: false; why: string }
+
+  /** Step 1: the record's bytes, complete, or not yet. */
+  async function fetchRecord(s: DeviceState, key: string): Promise<Fetch> {
+    try {
+      const got = await task<Got>(s, 'records/get/0.1', { roomId: cfg.roomDid, key, presentation: present(s, 'read') })
+      stats.gets++
+      if (!got || typeof got !== 'object' || !got.sealed || typeof got.sealed !== 'object') return { done: false, why: 'incomplete answer' }
+      return { done: true, got }
+    } catch (e) {
+      return { done: false, why: String((e as Error).message ?? e).slice(0, 120) }
     }
-    throw new Error('unreachable')
+  }
+
+  /** Step 2: the keys the record needs. A record is openable when its epoch lies between the earliest the member can read and the member's own; otherwise the chain and the commits are fetched, and if the host does not deliver them, it is not yet. */
+  async function ensureEpoch(s: DeviceState, recordEpoch: number | undefined): Promise<Epoch> {
+    const inRange = () => recordEpoch === undefined || (recordEpoch >= s.member.earliestReadableEpoch() && recordEpoch <= s.member.epoch)
+    if (s.synced && inRange()) return { done: true }
+    try {
+      await sync(s)
+    } catch (e) {
+      return { done: false, why: `epoch sync: ${String((e as Error).message ?? e).slice(0, 100)}` }
+    }
+    return inRange() ? { done: true } : { done: false, why: `record epoch ${recordEpoch} outside ${s.member.earliestReadableEpoch()}..${s.member.epoch} after sync` }
+  }
+
+  /** Step 3: the seal, with the keys in hand. Whatever fails here is final: a seal bound to another key, version or location opens for nobody, ever. */
+  function openSealed(s: DeviceState, key: string, got: Got): Open {
+    try {
+      return { valid: true, plain: s.member.openRecord(key, BigInt(got.sealed.version ?? got.version), JSON.stringify(got.sealed)) }
+    } catch (e) {
+      return { valid: false, why: String((e as Error).message ?? e).slice(0, 80) }
+    }
   }
 
   async function pull(s: DeviceState, d: Device): Promise<number> {
@@ -425,14 +454,15 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
       s.held.delete(key)
       if (!s.seen.has(key)) await deliver(key, msg)
     }
-    // List above the cursor and remember every new record before the cursor moves: a failed fetch or a
-    // host that is away for a moment must not skip a record for good (review #90 B1).
+    // List above the cursor and remember every new record before the cursor moves: nothing listed is
+    // forgotten until one of the three judgements below has settled it (review #90 B1).
     const listed = await listAbove(s, s.sinceVersion, `${run}/`)
     for (const r of listed) {
       if (r.version > s.sinceVersion && !s.seen.has(r.key) && !s.pending.has(r.key)) s.pending.set(r.key, r)
       s.sinceVersion = Math.max(s.sinceVersion, r.version)
     }
     const todo = [...s.pending.values()].sort((a, b) => a.version - b.version)
+    const notYet: string[] = []
     for (const r of faultState.reverse ? todo.reverse() : todo) {
       if (s.seen.has(r.key)) {
         s.pending.delete(r.key)
@@ -443,21 +473,25 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
         s.pending.delete(r.key)
         continue
       }
-      // A host error here propagates: the record stays pending and the next pull takes it again.
-      const got = await task<{ version: number; sealed: { version?: number } & Record<string, unknown> }>(s, 'records/get/0.1', { roomId: cfg.roomDid, key: r.key, presentation: present(s, 'read') })
-      stats.gets++
-      let plain: Uint8Array
-      try {
-        plain = await openRecord(s, r.key, got.sealed.version ?? got.version, got.sealed)
-      } catch (e) {
-        if (e instanceof HostError) throw e // the commit fetch failed at the host: pending, not given up
-        // A record this member cannot open (a replayed seal under another key, or a foreign seal): the carrier delivered nothing usable.
-        notes.push(`${d}: ${r.key} does not open (record epoch ${String((got.sealed as { epoch?: number }).epoch)} v${got.version}/${String(got.sealed.version)}, member epoch ${s.member.epoch}): ${String(e).slice(0, 60)}`)
+      const fetched = await fetchRecord(s, r.key)
+      if (!fetched.done) {
+        notYet.push(`${r.key}: ${fetched.why}`)
+        continue // pending; the next pull fetches it again
+      }
+      const epoch = await ensureEpoch(s, fetched.got.sealed.epoch)
+      if (!epoch.done) {
+        notYet.push(`${r.key}: ${epoch.why}`)
+        continue // pending; the keys may arrive with the next commits
+      }
+      const opened = openSealed(s, r.key, fetched.got)
+      if (!opened.valid) {
+        // Complete, keys in hand, and still closed: final. A replayed seal under another key, or a foreign seal.
+        notes.push(`${d}: ${r.key} invalid (record epoch ${String(fetched.got.sealed.epoch)} v${fetched.got.version}/${String(fetched.got.sealed.version)}, member ${s.member.earliestReadableEpoch()}..${s.member.epoch}): ${opened.why}`)
         s.seen.add(r.key)
         s.pending.delete(r.key)
         continue
       }
-      const f = JSON.parse(dec.decode(plain)) as Frame
+      const f = JSON.parse(dec.decode(opened.plain)) as Frame
       const msg: Msg = { id: ++carriedId, from: f.from, label: f.label, body: unb64(f.b) }
       s.pending.delete(r.key)
       if (withheld(msg)) {
@@ -466,6 +500,12 @@ export async function rltpBeekemDatarooms(options: DataroomsOptions = {}): Promi
       }
       await deliver(r.key, msg)
     }
+    if (notYet.length) {
+      // Pending work the host did not let us finish: the caller sees it (6.1: never silence), the records stay.
+      s.lastError = `awaiting-transport: ${notYet.length} record(s) not yet: ${notYet[0]}`
+      throw new HostError(0, 'pending', s.lastError)
+    }
+    s.lastError = undefined
     return n
   }
 

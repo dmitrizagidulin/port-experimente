@@ -116,16 +116,32 @@ Two findings from building it, both about the host, not the candidate:
 
 Review #90 (3 November) found a third thing, in the hull rather than at the
 host: the listing cursor moved past a record before its fetch had succeeded,
-so one failed `get` (a 503, a reset) skipped that record for good. Now every
-listed record is held as pending until it is delivered, withheld or given up
-(a seal that does not open), whatever order the carrier delivers in; a host
-error leaves it pending and the next pull takes it again. The hull also
-retries 502/503/504 and connection errors three times before the caller
-sees them, and when the host stores a record under a version other than the
-one the seal is bound to (a write landed in between), the frame goes again
-under a fresh key and the orphan stays as garbage (`stats.versionMismatches`).
-`tests/datarooms-cursor.test.ts` pins all of this against a host of its own
-(no VTI stack): pages of two, the failed fetch, reverse delivery, the single
+so one failed `get` skipped that record for good, and the hull read the
+*type* of an exception as a verdict on the record, so a broken download
+could pass as an unreadable seal. The rule now (Anton, 3 November): every
+record gets three separate judgements, and only the last one is final.
+
+1. **Fetch**: the record's bytes, complete, or *not yet*. Any failure,
+   whatever the exception (a 503, a reset, a broken download), leaves the
+   record pending, also after the hull's own retries (502/503/504 and
+   connection errors, three times) are spent.
+2. **Epoch**: the keys the record needs, from the chain and the commits. The
+   record is openable when its epoch lies between the earliest the member
+   can read and the member's own; if the host does not deliver the commits,
+   *not yet*, pending.
+3. **Seal**: with the bytes and the keys in hand, the record opens or it is
+   invalid for good (a replayed seal under another key or version, a foreign
+   seal). Only this judgement marks a record as seen without delivery.
+
+Delivered or deliberately withheld records are booked as such. A pull with
+records still pending ends with an `awaiting-transport` error, so the bench
+sees it (never silence) and the next pull takes them again, in whatever
+order the carrier lists. When the host stores a record under a version other
+than the one the seal is bound to (a write landed in between), the frame goes
+again under a fresh key and the orphan stays as garbage
+(`stats.versionMismatches`). `tests/datarooms-cursor.test.ts` pins all of this
+against a host of its own (no VTI stack): pages of two, a fetch that fails
+past the retries, a download that breaks off, reverse delivery, a single
 503, the version skew.
 
 What the host learned (check 3): keys `<run>/<device>/<seq>`, authors as

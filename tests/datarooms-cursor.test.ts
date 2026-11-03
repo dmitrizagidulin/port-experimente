@@ -43,7 +43,7 @@ function member(n: number): LiveMember {
 interface Rec { key: string; version: number; author: string; sealed: Record<string, unknown> }
 
 /** A host with the room's semantics the candidate relies on: room-wide versions, pages of `limit`, a cursor, `prefix` and `sinceVersion`. */
-function host(opts: { pageSize?: number; failGet?: (key: string, attempt: number) => number | undefined; storeAt?: (version: number) => number } = {}) {
+function host(opts: { pageSize?: number; failGet?: (key: string, attempt: number) => number | 'throw' | undefined; storeAt?: (version: number) => number } = {}) {
   const records: Rec[] = []
   const getAttempts = new Map<string, number>()
   const calls = { list: 0, get: 0, put: 0 }
@@ -71,6 +71,7 @@ function host(opts: { pageSize?: number; failGet?: (key: string, attempt: number
       const attempt = (getAttempts.get(key) ?? 0) + 1
       getAttempts.set(key, attempt)
       const fail = opts.failGet?.(key, attempt)
+      if (fail === 'throw') throw new TypeError('fetch failed: socket hang up')
       if (fail) return reply(doc, fail, null)
       const r = records.find((x) => x.key === key)
       if (!r) return reply(doc, 404, null)
@@ -119,11 +120,24 @@ describe('E16 transport hull against a host of its own', () => {
     const c = await group(h)
     await c.transport!.write('alice', 'hallo')
     target = h.records[h.records.length - 1]!.key
-    await expect(c.transport!.settle()).rejects.toThrow(/503/)
+    await expect(c.transport!.settle()).rejects.toThrow(/not yet|503/)
     expect(c.transport!.read('bob')).toEqual([])
     await c.transport!.settle()
     expect(c.transport!.read('bob')).toEqual(['hallo'])
     expect(h.getAttempts.get(target) ?? 0).toBeGreaterThanOrEqual(5)
+  })
+
+  it('a download that breaks off (fetch rejects) is not a verdict on the seal: the record stays pending', async () => {
+    let target: string | undefined
+    const h = host({ failGet: (key, attempt) => (key === target && attempt <= 4 ? 'throw' : undefined) })
+    const c = await group(h)
+    await c.transport!.write('alice', 'hallo')
+    target = h.records[h.records.length - 1]!.key
+    await expect(c.transport!.settle()).rejects.toThrow(/not yet|network|pending/)
+    expect(c.transport!.read('bob')).toEqual([])
+    await c.transport!.settle()
+    expect(c.transport!.read('bob')).toEqual(['hallo'])
+    expect(c.status('bob')).not.toMatch(/invalid/)
   })
 
   it('the same with the carrier delivering in reverse order', async () => {
@@ -136,7 +150,7 @@ describe('E16 transport hull against a host of its own', () => {
     await c.transport!.write('alice', 'zwei')
     await c.transport!.write('alice', 'drei')
     target = h.records[h.records.length - 2]!.key // the lower of the two new records fails; the higher one is processed first
-    await expect(c.transport!.settle()).rejects.toThrow(/503/)
+    await expect(c.transport!.settle()).rejects.toThrow(/not yet|503/)
     await c.transport!.settle()
     expect(c.transport!.read('bob')).toEqual(['drei', 'eins', 'zwei'])
   })
