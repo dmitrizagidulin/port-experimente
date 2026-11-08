@@ -6,7 +6,11 @@ E12; background `rltp/design/pws-bruecke-2026-10.md`. Portable Web Spaces
 with the unchanged BeeKEM candidate (E6–E9) on top. Only the transport
 changes. Server: `was-teaching-server` 0.42.2 in process
 (`startTestServer`, own temp storage per server), client
-`@interop/was-client` 0.96; both require Node ≥ 24.
+`@interop/was-client` 0.96; both require Node ≥ 24. Both packages have
+since been renamed: the server is `@interop/web-spaces-server` from 0.44.0
+(repository `interop-alliance/web-spaces-server`), the client
+`@interop/pws-client` from 0.104.0. The versions pinned here keep the old
+names.
 
 ## Variant (a): blind storage
 
@@ -33,7 +37,7 @@ changes. Server: `was-teaching-server` 0.42.2 in process
 | | Result | Reason |
 |---|---|---|
 | S1–S4f, S4j, S5, S5c, S6b, S8 | passed | as at the bench relay |
-| S6 | failed | as without a server: history only via the chain |
+| S6 | passed | matrix run of 20 October 2026; the first run (11 October) failed: history only via the chain |
 | S4e, S4j | passed | fork and fork end run over the feed as over the relay |
 | S5b, S7 | not applicable | the bench does not see the frames (they lie at the server), so no theft model via `w.log` |
 | S10a–c | not applicable | the server is blind, no enforcing service (variant a) |
@@ -80,8 +84,9 @@ bench (E10/E11) as a door of its own, not in this candidate.
 
 The server additionally sees: resource ids with device names and sequence
 numbers (a pseudonym per device × group would be the answer, E8 finding
-5), the frame labels, sizes and the read times per device via the
-checkpoints.
+5), the frame labels and sizes. The server stores no checkpoints: it sees
+one only in each read request, and with one shared key it cannot tie a
+request to a device.
 
 ### Check 4: server switch
 
@@ -99,8 +104,9 @@ lose; authority and keys live with the members.
 
 Not built; derived from the server code (`was-teaching-server` 0.42.2).
 
-- **Controller registry.** `src/lib/validateDid.ts` admits `did:key` and
-  `did:webvh` as controllers; `src/lib/webvhController.ts` resolves a
+- **Controller methods.** There is no registry of DID methods; the two
+  admitted ones are hard-coded. `src/lib/validateDid.ts` admits `did:key`
+  and `did:webvh` as controllers; `src/lib/webvhController.ts` resolves a
   self-hosted `did:webvh` from a log in the space and verifies the history
   locally; `src/zcap.ts` (1,863 lines) hooks this resolver into signature
   verification (`setDidResolver(didResolverWithWebvh(…))`). An RLTP profile
@@ -111,10 +117,13 @@ Not built; derived from the server code (`was-teaching-server` 0.42.2).
   by a key of its predecessor but by m identities from predecessor ∩
   successor (intersection rule); log verification therefore needs a quorum
   rule instead of the single signature. The resolver hook exists, the
-  method does not.
-- **Container rule.** `src/lib/containerRule.ts`: deleting a space,
-  replacing space meta, deleting a collection are "controller-only" =
-  direct root invocation by the controller. With the group as controller,
+  method does not; adding one is a change to `validateDid.ts` and to the
+  resolver in `zcap.ts`.
+- **Container rule.** `src/lib/containerRule.ts`: replacing space meta and
+  deleting a collection are "controller-only" = direct root invocation by
+  the controller. Deleting a space additionally admits a delegated
+  capability that targets exactly the space URL with `allowedAction`
+  exactly `['DELETE']` (the `exact-delete` rule). With the group as controller,
   every listed device would be "the controller" and could delete. A profile
   would have to bind these operations to a quorum; HTTP signatures carry
   one signature, not a quorum. Way out: a quorum-signed entry in the chain
@@ -125,6 +134,12 @@ Not built; derived from the server code (`was-teaching-server` 0.42.2).
   of the document; WAS's current-key-set rule makes that effective at the
   server immediately, including everything that key delegated. That is
   service class "view" from Access §9.3, without a service of our own.
+  The server offers this path today without a new method: promote the
+  space to a self-hosted `did:webvh` whose document lists each device key
+  under `capabilityInvocation`; removing a key from the document removes
+  it at the server. What `did:webvh` cannot give is a quorum-signed log
+  update (a single update key signs each entry), so the quorum rule, not
+  the resolver, is the gap a new method would close.
 - **Variant (c), log replica:** the server materializes the authority log.
   That would be a governing profile of their governing history logs (the
   server checks only the line format, readers verify) plus server-side
@@ -133,11 +148,12 @@ Not built; derived from the server code (`was-teaching-server` 0.42.2).
   the server (E8 finding 5), the chain as a resource log in the space, and
   the decision on finding 9 (which quorum rule the chain runs).
 
-**Estimate:** (b) is a profile in the registry plus a container exception,
-on their side perhaps a few hundred lines at a resolver whose hook already
-exists; (c) a new server part. With (a) as the floor, (b) suffices for
-everything E8 demanded of the service, and their spec would stay unchanged
-if the registry is open.
+**Estimate:** (b) is a new method in `validateDid.ts` and the resolver in
+`zcap.ts`, plus a container exception, on their side perhaps a few hundred
+lines at a resolver whose hook already exists; (c) a new server part. With
+(a) as the floor, (b) suffices for everything E8 demanded of the service.
+Their spec would stay unchanged only if its authorization profile admitted
+the method; today the two methods are fixed in code.
 
 ## Carrier bench (E10)
 

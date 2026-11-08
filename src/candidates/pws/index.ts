@@ -65,8 +65,7 @@ export async function rltpBeekemPws(options: PwsOptions = {}): Promise<Candidate
   const { fastify, serverUrl, faults: serverFaults } = await startTestServer({ backend: await openTempBackend() })
   // Der Gruppenschlüssel: ein did:key, von allen Geräten gehalten.
   const groupKey = await Ed25519VerificationKey.generate()
-  groupKey.controller = `did:key:${groupKey.fingerprint()}`
-  groupKey.id = `${groupKey.controller}#${groupKey.fingerprint()}`
+  const groupController = `did:key:${groupKey.fingerprint()}`
   const devices = new Map<Device, DeviceState>()
   let space: { id: string } | undefined
   let active = { serverUrl, fastify, serverFaults }
@@ -92,7 +91,7 @@ export async function rltpBeekemPws(options: PwsOptions = {}): Promise<Candidate
     if (!s) throw new Error(`unbekanntes Gerät ${d}`)
     return s
   }
-  const client = (s: DeviceState) => (s.was ??= WasClient.fromSigner({ serverUrl: active.serverUrl, signer: groupKey.signer() }))
+  const client = (s: DeviceState) => (s.was ??= WasClient.fromSigner({ serverUrl: active.serverUrl, signer: groupKey.didKeySigner() }))
   const collection = (s: DeviceState) => client(s).space(space!.id).collection('frames')
 
   async function timed<T>(f: () => Promise<T>): Promise<T> {
@@ -266,13 +265,13 @@ export async function rltpBeekemPws(options: PwsOptions = {}): Promise<Candidate
   const pws: PwsHandle = {
     faults: faults as PwsHandle['faults'],
     serverUrl: () => active.serverUrl,
-    controller: groupKey.controller!,
+    controller: groupController,
     stats,
     /** Was der Server über die Gruppe hält: Resource-IDs und Größen, aus Sicht eines Clients mit dem Gruppenschlüssel. */
     async inventory() {
       const s = devices.values().next().value as DeviceState
       const listing = await collection(s).list()
-      return { controller: groupKey.controller!, spaceId: space?.id, resources: listing?.items.map((i: { id: string }) => i.id) ?? [] }
+      return { controller: groupController, spaceId: space?.id, resources: listing?.items.map((i: { id: string }) => i.id) ?? [] }
     },
     /** Prüfpunkt 4: Umzug auf einen neuen Server per Export/Import; danach lesen alle von dort. */
     async moveToNewServer() {
@@ -281,7 +280,7 @@ export async function rltpBeekemPws(options: PwsOptions = {}): Promise<Candidate
       const next = await startTestServer({ backend: await openTempBackend() })
       let imported: { resourcesCreated: number; resourcesSkipped: number }
       try {
-        const was = WasClient.fromSigner({ serverUrl: next.serverUrl, signer: groupKey.signer() })
+        const was = WasClient.fromSigner({ serverUrl: next.serverUrl, signer: groupKey.didKeySigner() })
         const sp = await was.createSpace({ name: 'gruppe', id: space!.id })
         imported = (await sp.import(archive)) as typeof imported
       } catch (e) {
