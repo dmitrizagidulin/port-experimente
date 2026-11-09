@@ -137,7 +137,12 @@ Not built; derived from the server code (`was-teaching-server` 0.42.2).
   The server offers this path today without a new method: promote the
   space to a self-hosted `did:webvh` whose document lists each device key
   under `capabilityInvocation`; removing a key from the document removes
-  it at the server. What `did:webvh` cannot give is a quorum-signed log
+  it at the server. This holds only with `@interop/did-method-webvh`
+  5.16.0 or later: earlier versions accepted a log entry whose `proof` is
+  an empty array, so any holder of a write grant on `did.jsonl` could have
+  added or kept a device key without the update key. The server requires
+  the fixed library from 0.42.3; the 0.42.2 pinned here resolves 5.14.0
+  and is affected. What `did:webvh` cannot give is a quorum-signed log
   update (a single update key signs each entry), so the quorum rule, not
   the resolver, is the gap a new method would close.
 - **Variant (c), log replica:** the server materializes the authority log.
